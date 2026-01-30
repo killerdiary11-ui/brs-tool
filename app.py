@@ -54,12 +54,18 @@ def load_data(file, file_type):
             st.error(f"Could not read {file_type}. Please ensure it is a valid CSV or Excel file.")
             return None
 
-    # 3. Find the Header Row (Look for 'Date')
+    # 3. Find the Header Row (Look for specific columns)
     header_idx = -1
     if df_raw is not None:
         for i, row in df_raw.iterrows():
             row_str = row.astype(str).str.lower().tolist()
-            if any("date" in s for s in row_str):
+            
+            # CRITICAL FIX: Ledger usually has "Vch/Bill" or "Account", Bank has "Narration"
+            # We use loose matching to capture both styles
+            is_bank_header = any("narration" in s for s in row_str) and any("date" in s for s in row_str)
+            is_book_header = any("vch" in s for s in row_str) or (any("account" in s for s in row_str) and any("debit" in s for s in row_str))
+            
+            if is_bank_header or is_book_header:
                 header_idx = i
                 break
     
@@ -106,24 +112,30 @@ if ledger_file and bank_file:
         try:
             df_book.columns = df_book.columns.str.strip()
             
-            # Map Ledger Columns (Adjust if your column names differ slightly)
-            # We look for "Debit(Rs.)" or just "Debit"
-            debit_col = next((c for c in df_book.columns if 'Debit' in c), None)
-            credit_col = next((c for c in df_book.columns if 'Credit' in c), None)
+            # Case-insensitive column search
+            cols_lower = [c.lower() for c in df_book.columns]
             
-            if not debit_col or not credit_col:
-                st.error("Could not find Debit/Credit columns in Ledger. Please check header.")
+            # Find Debit Column
+            debit_idx = next((i for i, c in enumerate(cols_lower) if 'debit' in c), None)
+            # Find Credit Column
+            credit_idx = next((i for i, c in enumerate(cols_lower) if 'credit' in c), None)
+            
+            if debit_idx is None or credit_idx is None:
+                st.error("Could not find Debit/Credit columns in Ledger. Please ensure header row is correct.")
+                st.write("Columns found:", df_book.columns.tolist())
                 st.stop()
+            
+            # Get actual column names
+            debit_col = df_book.columns[debit_idx]
+            credit_col = df_book.columns[credit_idx]
                 
             book_clean = df_book.copy()
             book_clean['Debit'] = book_clean[debit_col].apply(clean_currency).fillna(0)
             book_clean['Credit'] = book_clean[credit_col].apply(clean_currency).fillna(0)
             
-            # Match Logic: 
-            # Receipt (Debit) -> Positive
-            # Payment (Credit) -> Negative (for matching logic)
-            # Actually, let's keep absolute amounts for matching
-            
+            # Standardize Dates (Optional but recommended)
+            # book_clean['Date'] = pd.to_datetime(book_clean['Date'], errors='coerce')
+
             book_clean['Match_Amount'] = book_clean.apply(
                 lambda x: x['Debit'] if x['Debit'] > 0 else x['Credit'], axis=1
             )
@@ -139,14 +151,20 @@ if ledger_file and bank_file:
         # --- Preprocessing Bank Statement ---
         try:
             df_bank.columns = df_bank.columns.str.strip()
+            cols_lower = [c.lower() for c in df_bank.columns]
             
-            # Map Bank Columns (HDFC usually has "Withdrawal Amt." and "Deposit Amt.")
-            w_col = next((c for c in df_bank.columns if 'Withdrawal' in c), None)
-            d_col = next((c for c in df_bank.columns if 'Deposit' in c), None)
+            # Find Withdrawal Column
+            w_idx = next((i for i, c in enumerate(cols_lower) if 'withdrawal' in c), None)
+            # Find Deposit Column
+            d_idx = next((i for i, c in enumerate(cols_lower) if 'deposit' in c), None)
             
-            if not w_col or not d_col:
+            if w_idx is None or d_idx is None:
                 st.error("Could not find Withdrawal/Deposit columns in Bank Statement.")
+                st.write("Columns found:", df_bank.columns.tolist())
                 st.stop()
+            
+            w_col = df_bank.columns[w_idx]
+            d_col = df_bank.columns[d_idx]
             
             bank_clean = df_bank.copy()
             bank_clean['Withdrawal'] = bank_clean[w_col].apply(clean_currency).fillna(0)
@@ -201,14 +219,18 @@ if ledger_file and bank_file:
                 bank_clean.at[bank_idx, 'Matched'] = True
                 
                 # Get Narration safely
-                book_narr = str(book_row.get('Short Narration', book_row.get('Account', '')))
-                bank_narr = str(bank_clean.at[bank_idx, 'Narration'])
+                # Try to find common narration columns
+                book_narr_col = next((c for c in df_book.columns if 'narration' in c.lower() or 'account' in c.lower()), 'Narration')
+                bank_narr_col = next((c for c in df_bank.columns if 'narration' in c.lower()), 'Narration')
+                
+                book_narr = str(book_row.get(book_narr_col, ''))
+                bank_narr = str(bank_clean.at[bank_idx, bank_narr_col]) if bank_narr_col in bank_clean.columns else ''
                 
                 match_record = {
                     'Amount': amt,
                     'Type': b_type,
-                    'Book_Date': book_row['Date'],
-                    'Bank_Date': bank_clean.at[bank_idx, 'Date'],
+                    'Book_Date': book_row.get('Date', ''),
+                    'Bank_Date': bank_clean.at[bank_idx, 'Date'] if 'Date' in bank_clean.columns else '',
                     'Book_Ref': book_narr,
                     'Bank_Ref': bank_narr
                 }
@@ -221,7 +243,7 @@ if ledger_file and bank_file:
         
         st.success(f"Reconciliation Complete! {len(matches)} transactions matched.")
         
-        tab1, tab2, tab3 = st.tabs(["Matched", "Missing in Bank (Cheques Issued/etc)", "Missing in Books (Bank Charges/etc)"])
+        tab1, tab2, tab3 = st.tabs(["Matched", "Missing in Bank", "Missing in Books"])
         
         with tab1:
             st.dataframe(pd.DataFrame(matches))
