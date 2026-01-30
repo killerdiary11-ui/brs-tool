@@ -1,50 +1,54 @@
 def load_data(file, file_type):
-    """Loads CSV and automatically finds the header row with encoding fallback."""
-    # List of encodings to try
-    encodings = ['utf-8', 'ISO-8859-1', 'cp1252']
-    
+    """Robust loader for CSV and Excel with auto-header detection."""
     df_raw = None
-    
-    # 1. Try loading the file with different encodings
+    used_encoding = 'utf-8'
+    loader_type = 'csv' # distinct track of which method worked
+
+    # 1. Try CSV with different encodings
+    encodings = ['utf-8', 'ISO-8859-1', 'cp1252']
     for enc in encodings:
         try:
-            file.seek(0) # Reset file pointer to the beginning
+            file.seek(0)
             df_raw = pd.read_csv(file, encoding=enc)
-            break # If successful, stop trying
+            used_encoding = enc
+            loader_type = 'csv'
+            break
         except (UnicodeDecodeError, pd.errors.ParserError):
             continue
-            
-    # If standard CSV reading fails, try Excel engine (just in case user uploaded xlsx renamed as csv)
+    
+    # 2. If CSV failed, try Excel
     if df_raw is None:
         try:
             file.seek(0)
             df_raw = pd.read_excel(file)
+            loader_type = 'excel'
         except Exception:
-            st.error(f"Could not read {file_type}. Please save your file as a standard CSV (Comma delimited) or Excel (.xlsx) file.")
+            st.error(f"Could not read {file_type}. Please ensure it is a valid CSV or Excel file.")
             return None
 
-    # 2. Find the Header Row
-    # Look for the row containing 'Date' to treat as header
+    # 3. Find the Header Row (Look for 'Date')
     header_idx = -1
-    for i, row in df_raw.iterrows():
-        # Convert row to string, lowercase it, and check for "date"
-        row_str = row.astype(str).str.lower().tolist()
-        if any("date" in s for s in row_str):
-            header_idx = i
-            break
+    if df_raw is not None:
+        for i, row in df_raw.iterrows():
+            row_str = row.astype(str).str.lower().tolist()
+            if any("date" in s for s in row_str):
+                header_idx = i
+                break
     
-    # 3. Reload with the correct header
+    # 4. Reload with correct header
     try:
         file.seek(0)
-        # Use the successful encoding we found earlier
-        used_encoding = enc if 'enc' in locals() else 'utf-8'
-        
-        if header_idx != -1:
-            df = pd.read_csv(file, header=header_idx+1, encoding=used_encoding)
-        else:
-            df = df_raw # Fallback if no "Date" row found
-            
-        return df
+        if loader_type == 'csv':
+            if header_idx != -1:
+                return pd.read_csv(file, header=header_idx+1, encoding=used_encoding)
+            else:
+                return df_raw
+        else: # Excel
+            if header_idx != -1:
+                return pd.read_excel(file, header=header_idx+1)
+            else:
+                return df_raw
+                
     except Exception as e:
-        st.error(f"Error processing {file_type}: {e}")
+        st.error(f"Error final processing {file_type}: {e}")
         return None
