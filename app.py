@@ -25,92 +25,89 @@ def parse_dates(series):
     """Attempts to convert a column to datetime objects safely."""
     return pd.to_datetime(series, dayfirst=True, errors='coerce')
 
-def load_data(file, file_type):
-    """Robust loader for CSV and Excel with auto-header detection."""
+def load_data(uploaded_file):
+    """Smart loader that checks file extension first."""
+    if uploaded_file is None:
+        return None
+        
+    filename = uploaded_file.name.lower()
     df_raw = None
-    used_encoding = 'utf-8'
-    loader_type = 'csv' 
-
-    # 1. Try CSV with different encodings
-    encodings = ['utf-8', 'ISO-8859-1', 'cp1252']
-    for enc in encodings:
-        try:
-            file.seek(0)
-            df_raw = pd.read_csv(file, encoding=enc)
-            used_encoding = enc
-            loader_type = 'csv'
-            break
-        except (UnicodeDecodeError, pd.errors.ParserError):
-            continue
     
-    # 2. If CSV failed, try Excel
-    if df_raw is None:
-        try:
-            file.seek(0)
-            df_raw = pd.read_excel(file)
-            loader_type = 'excel'
-        except Exception:
-            st.error(f"Could not read {file_type}. Please ensure it is a valid CSV or Excel file.")
+    try:
+        # 1. Strict Excel Check
+        if filename.endswith(('.xlsx', '.xls')):
+            uploaded_file.seek(0)
+            df_raw = pd.read_excel(uploaded_file)
+            
+        # 2. Strict CSV Check
+        elif filename.endswith('.csv'):
+            encodings = ['utf-8', 'ISO-8859-1', 'cp1252']
+            for enc in encodings:
+                try:
+                    uploaded_file.seek(0)
+                    df_raw = pd.read_csv(uploaded_file, encoding=enc)
+                    break
+                except:
+                    continue
+        else:
+            st.error("Unsupported file format. Please use .csv or .xlsx")
             return None
 
-    # 3. Find the Header Row
-    header_idx = -1
-    if df_raw is not None:
-        for i, row in df_raw.iterrows():
-            row_str = row.astype(str).str.lower().tolist()
-            # Loose matching to find the header row
-            # Bank usually has "Narration" + "Date"
-            # Ledger usually has "Vch" or "Account" or "Type"
-            is_bank_header = any("narration" in s for s in row_str) and any("date" in s for s in row_str)
-            is_book_header = (any("vch" in s for s in row_str) or any("type" in s for s in row_str)) and any("date" in s for s in row_str)
-            
-            if is_bank_header or is_book_header:
-                header_idx = i
-                break
-    
-    # 4. Reload with correct header
-    try:
-        file.seek(0)
-        if loader_type == 'csv':
-            if header_idx != -1:
-                return pd.read_csv(file, header=header_idx+1, encoding=used_encoding)
-            else:
-                return df_raw
-        else: # Excel
-            if header_idx != -1:
-                return pd.read_excel(file, header=header_idx+1)
-            else:
-                return df_raw
-                
     except Exception as e:
-        st.error(f"Error final processing {file_type}: {e}")
+        st.error(f"Error loading file: {e}")
         return None
+
+    if df_raw is None:
+        st.error("Could not read the file. It might be corrupted or encrypted.")
+        return None
+
+    # 3. Find the Header Row (Auto-detection)
+    header_idx = -1
+    for i, row in df_raw.iterrows():
+        row_str = row.astype(str).str.lower().tolist()
+        
+        # Look for "Date" AND ("Narration" OR "Debit" OR "Credit" OR "Withdraw" OR "Deposit")
+        has_date = any("date" in s for s in row_str)
+        has_keyword = any(k in s for s in row_str for k in ['narration', 'debit', 'credit', 'withdraw', 'deposit', 'vch', 'particulars'])
+        
+        if has_date and has_keyword:
+            header_idx = i
+            break
+    
+    # 4. Reload with correct header if needed
+    if header_idx != -1:
+        # If headers are not in the first row, we must reload
+        uploaded_file.seek(0)
+        if filename.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(uploaded_file, header=header_idx+1)
+        else:
+            # Re-read CSV with identified encoding (assuming 'utf-8' fallback if unknown)
+            return pd.read_csv(uploaded_file, header=header_idx+1, encoding='ISO-8859-1') # fallback encoding
+    
+    return df_raw
 
 # --- Main App Logic ---
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    date_tolerance = st.slider(
-        "Date Match Window (Days)", 
-        min_value=0, max_value=60, value=5
-    )
+    date_tolerance = st.slider("Date Match Window (Days)", 0, 60, 5)
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1. Upload Ledger (Book)")
-    ledger_file = st.file_uploader("Upload Ledger CSV/Excel", type=['csv', 'xlsx', 'xls'])
+    ledger_file = st.file_uploader("Upload Ledger", type=['csv', 'xlsx', 'xls'], key="ledger")
 
 with col2:
     st.subheader("2. Upload Bank Statement")
-    bank_file = st.file_uploader("Upload Bank CSV/Excel", type=['csv', 'xlsx', 'xls'])
+    bank_file = st.file_uploader("Upload Bank", type=['csv', 'xlsx', 'xls'], key="bank")
 
 if ledger_file and bank_file:
     st.divider()
     
     # 1. Load Data
-    df_book = load_data(ledger_file, "Ledger")
-    df_bank = load_data(bank_file, "Bank Statement")
+    df_book = load_data(ledger_file)
+    df_bank = load_data(bank_file)
 
     if df_book is not None and df_bank is not None:
         
@@ -119,26 +116,14 @@ if ledger_file and bank_file:
             df_book.columns = df_book.columns.str.strip()
             cols_lower = [c.lower() for c in df_book.columns]
             
-            # --- INTELLIGENT COLUMN MAPPING ---
-            # 1. Try to find "Debit" or "Deposit" (Money IN)
-            debit_idx = next((i for i, c in enumerate(cols_lower) if 'debit' in c), None)
-            if debit_idx is None:
-                # Fallback: Look for "Deposit"
-                debit_idx = next((i for i, c in enumerate(cols_lower) if 'deposit' in c), None)
-
-            # 2. Try to find "Credit" or "Withdraw" (Money OUT)
-            credit_idx = next((i for i, c in enumerate(cols_lower) if 'credit' in c), None)
-            if credit_idx is None:
-                # Fallback: Look for "Withdraw" (handles "Withdrawls" typo too)
-                credit_idx = next((i for i, c in enumerate(cols_lower) if 'withdraw' in c), None)
-
+            # Smart Column Mapping
+            debit_idx = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['debit', 'deposit'])), None)
+            credit_idx = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['credit', 'withdraw'])), None)
             date_idx = next((i for i, c in enumerate(cols_lower) if 'date' in c), None)
             
-            # Check if we found them
             if debit_idx is None or credit_idx is None:
-                st.error("Could not identify Amount columns in Ledger.")
+                st.error("Could not find Amount columns in Ledger. Looked for: Debit/Credit/Deposits/Withdrawals")
                 st.write("Columns found:", df_book.columns.tolist())
-                st.write("Please ensure your ledger has columns named 'Debit/Credit' OR 'Deposits/Withdrawals'.")
                 st.stop()
             
             debit_col = df_book.columns[debit_idx]
@@ -149,13 +134,11 @@ if ledger_file and bank_file:
             book_clean['Debit'] = book_clean[debit_col].apply(clean_currency).fillna(0)
             book_clean['Credit'] = book_clean[credit_col].apply(clean_currency).fillna(0)
             
-            # Date Parsing
             if date_col:
                 book_clean['Date_Obj'] = parse_dates(book_clean[date_col])
             else:
                 book_clean['Date_Obj'] = pd.NaT
 
-            # In Books: Deposit = Debit (Receipt), Withdrawal = Credit (Payment)
             book_clean['Match_Amount'] = book_clean.apply(
                 lambda x: x['Debit'] if x['Debit'] > 0 else x['Credit'], axis=1
             )
@@ -165,7 +148,7 @@ if ledger_file and bank_file:
             book_clean['Matched'] = False
             
         except Exception as e:
-            st.error(f"Error processing Ledger columns: {e}")
+            st.error(f"Error processing Ledger: {e}")
             st.stop()
 
         # --- Preprocessing Bank Statement ---
@@ -173,12 +156,12 @@ if ledger_file and bank_file:
             df_bank.columns = df_bank.columns.str.strip()
             cols_lower = [c.lower() for c in df_bank.columns]
             
-            w_idx = next((i for i, c in enumerate(cols_lower) if 'withdraw' in c or 'debit' in c), None)
-            d_idx = next((i for i, c in enumerate(cols_lower) if 'deposit' in c or 'credit' in c), None)
+            w_idx = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['withdraw', 'debit'])), None)
+            d_idx = next((i for i, c in enumerate(cols_lower) if any(x in c for x in ['deposit', 'credit'])), None)
             date_idx = next((i for i, c in enumerate(cols_lower) if 'date' in c), None)
             
             if w_idx is None or d_idx is None:
-                st.error("Could not find Withdrawal/Deposit columns in Bank Statement.")
+                st.error("Could not find Amount columns in Bank Statement.")
                 st.write("Columns found:", df_bank.columns.tolist())
                 st.stop()
             
@@ -204,7 +187,7 @@ if ledger_file and bank_file:
             bank_clean['Matched'] = False
             
         except Exception as e:
-            st.error(f"Error processing Bank columns: {e}")
+            st.error(f"Error processing Bank: {e}")
             st.stop()
 
         # --- RECONCILIATION ENGINE ---
@@ -220,21 +203,19 @@ if ledger_file and bank_file:
             
             b_type = book_row['Type']
             
-            # Logic: Book Receipt (Deposit) matches Bank Deposit
             if b_type == 'Receipt':
                 candidates = bank_clean[
                     (bank_clean['Type'] == 'Deposit') & 
                     (np.isclose(bank_clean['Match_Amount'], amt, atol=0.01)) & 
                     (bank_clean['Matched'] == False)
                 ]
-            else: # Payment (Withdrawal) matches Bank Withdrawal
+            else: 
                 candidates = bank_clean[
                     (bank_clean['Type'] == 'Withdrawal') & 
                     (np.isclose(bank_clean['Match_Amount'], amt, atol=0.01)) & 
                     (bank_clean['Matched'] == False)
                 ]
             
-            # Date Matching
             valid_candidates = candidates
             if pd.notna(book_date) and not candidates.empty:
                 candidates['days_diff'] = (candidates['Date_Obj'] - book_date).abs().dt.days
@@ -247,29 +228,27 @@ if ledger_file and bank_file:
                 book_clean.at[i, 'Matched'] = True
                 bank_clean.at[bank_idx, 'Matched'] = True
                 
-                # Narration Handling
-                book_narr_col = next((c for c in df_book.columns if 'narration' in c.lower() or 'account' in c.lower()), 'Narration')
-                bank_narr_col = next((c for c in df_bank.columns if 'narration' in c.lower()), 'Narration')
-                
+                # Narration Matching
+                book_narr = str(book_row.get(next((c for c in df_book.columns if 'narration' in c.lower() or 'account' in c.lower()), 'Narration'), ''))
+                bank_narr = str(bank_clean.at[bank_idx, next((c for c in df_bank.columns if 'narration' in c.lower()), 'Narration')] if next((c for c in df_bank.columns if 'narration' in c.lower()), None) else '')
+
                 matches.append({
                     'Amount': amt,
                     'Type': b_type,
                     'Book_Date': book_row.get(date_col, ''),
                     'Bank_Date': bank_clean.at[bank_idx, b_date_col] if b_date_col else '',
-                    'Book_Ref': str(book_row.get(book_narr_col, '')),
-                    'Bank_Ref': str(bank_clean.at[bank_idx, bank_narr_col]) if bank_narr_col in bank_clean.columns else ''
+                    'Book_Ref': book_narr,
+                    'Bank_Ref': bank_narr
                 })
 
         # --- Results ---
         st.success(f"Reconciliation Complete! {len(matches)} matched.")
         
         tab1, tab2, tab3 = st.tabs(["✅ Matched", "⚠️ Missing in Bank", "⚠️ Missing in Books"])
-        
         with tab1: st.dataframe(pd.DataFrame(matches))
         with tab2: st.dataframe(book_clean[book_clean['Matched'] == False])
         with tab3: st.dataframe(bank_clean[bank_clean['Matched'] == False])
         
-        # --- Download ---
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             pd.DataFrame(matches).to_excel(writer, sheet_name='Matched', index=False)
